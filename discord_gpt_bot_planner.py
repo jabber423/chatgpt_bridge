@@ -3,6 +3,7 @@ import re
 import json
 import time
 import asyncio
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -488,9 +489,13 @@ async def collect_channel_history(
                 if collect_embeds:
                     embed_parts = []
                     embed_data = embed.to_dict()
-                    raid_usernames = get_raid_usernames({
+                    raid_signups = parse_raid_signups({
                         "embed": embed_data,
                     })
+                    raid_usernames = [
+                        signup.name
+                        for signup in raid_signups
+                    ]
                     event_timestamp = get_raid_event_timestamp({
                         "embed": embed_data,
                     })
@@ -523,10 +528,10 @@ async def collect_channel_history(
                             if field_index < len(raw_fields)
                             else {}
                         )
-                        field_usernames = get_raid_usernames({
+                        field_signups = parse_raid_signups({
                             "embed": {"fields": [field_data]},
                         })
-                        if raid_usernames and field_usernames:
+                        if raid_signups and field_signups:
                             continue
 
                         field_name = await decode_discord_ids(
@@ -543,14 +548,31 @@ async def collect_channel_history(
                             f"{field_name}: {field_value}"
                         )
 
-                    if raid_usernames:
-                        embed_parts.append(
-                            "Raid-Helper response names "
-                            "(all statuses count as a response):\n"
-                            + "\n".join(
-                                f"- {name}"
-                                for name in raid_usernames
+                    if raid_signups:
+                        signup_lines = []
+                        for signup in raid_signups:
+                            role_parts = [
+                                part
+                                for part in (
+                                    signup.class_name,
+                                    signup.spec,
+                                )
+                                if part
+                            ]
+                            role_text = (
+                                f" — {' / '.join(role_parts)}"
+                                if role_parts
+                                else ""
                             )
+                            signup_lines.append(
+                                f"- #{signup.signup_order} {signup.name} "
+                                f"[{signup.status}]{role_text}"
+                            )
+
+                        embed_parts.append(
+                            "Raid-Helper responses "
+                            "(all statuses count as a response):\n"
+                            + "\n".join(signup_lines)
                         )
 
                     if embed.footer and embed.footer.text:
@@ -573,6 +595,10 @@ async def collect_channel_history(
                         "embed_index": embed_index,
                         "embed": embed.to_dict(),
                         "raid_usernames": raid_usernames,
+                        "raid_signups": [
+                            asdict(signup)
+                            for signup in raid_signups
+                        ],
                         "event_timestamp": (
                             event_timestamp.isoformat()
                             if event_timestamp
@@ -581,12 +607,16 @@ async def collect_channel_history(
                         "flattened_text": "\n".join(embed_parts),
                     })
 
-                    if raid_usernames:
+                    if raid_signups:
                         raid_events.append({
                             "channel": getattr(channel, "name", "DM"),
                             "message_timestamp": msg.created_at,
                             "event_timestamp": event_timestamp,
                             "usernames": raid_usernames,
+                            "signups": [
+                                asdict(signup)
+                                for signup in raid_signups
+                            ],
                         })
 
                     if embed_parts:
@@ -1178,30 +1208,76 @@ async def send_openai_error(message, error):
 # Discord events
 # ============================================================
 
-def get_raid_usernames(data: dict) -> list[str]:
-    usernames = []
+@dataclass(frozen=True)
+class RaidSignup:
+    name: str
+    signup_order: int
+    status: str = "confirmed"
+    class_name: Optional[str] = None
+    spec: Optional[str] = None
+
+
+def parse_raid_signups(data: dict) -> list[RaidSignup]:
+    """Parse Raid-Helper embed fields into structured signup records."""
+    signups = []
     seen = set()
 
     for field in data.get("embed", {}).get("fields", []):
-        value = field.get("value", "")
+        # Raid-Helper markdown may arrive either escaped or unescaped.
+        value = str(field.get("value", "")).replace("\\", "")
 
-        # Matches:
-        # `1` **Muskazze**
-        # `19` **Gestaz/Tabaska**
-        # `18` **Scurry(Beeline)**
-        matches = re.findall(
-            r"\\?`\d+\\?`\s+\\?\*\\?\*(.+?)\\?\*\\?\*",
-            value
+        status = "confirmed"
+        if re.search(r"\bBench\s*\(\d+\)", value, re.IGNORECASE):
+            status = "bench"
+        elif re.search(r"\bAbsence\s*\(\d+\)", value, re.IGNORECASE):
+            status = "absence"
+
+        class_match = re.search(
+            r"\*\*__([^_]+)__\s*\(\d+\)\*\*",
+            value,
+        )
+        class_name = (
+            class_match.group(1).strip()
+            if class_match
+            else None
         )
 
-        for match in matches:
-            username = match.strip()
-            key = username.casefold()
-            if key not in seen:
-                usernames.append(username)
-                seen.add(key)
+        # Examples:
+        # <:Elemental:637...> `1` **Muskazze**
+        # `20` **Roufas/Duckstock**
+        signup_pattern = re.compile(
+            r"(?:<:([A-Za-z0-9_]+):\d+>\s*)?"
+            r"`(\d+)`\s+\*\*(.+?)\*\*"
+        )
 
-    return usernames
+        for match in signup_pattern.finditer(value):
+            spec, signup_order, name = match.groups()
+            name = name.strip()
+            key = (int(signup_order), name.casefold())
+
+            if key in seen:
+                continue
+
+            signups.append(
+                RaidSignup(
+                    name=name,
+                    signup_order=int(signup_order),
+                    status=status,
+                    class_name=class_name,
+                    spec=spec,
+                )
+            )
+            seen.add(key)
+
+    return signups
+
+
+def get_raid_usernames(data: dict) -> list[str]:
+    """Compatibility helper for callers that only need response names."""
+    return [
+        signup.name
+        for signup in parse_raid_signups(data)
+    ]
 
 
 def get_raid_event_timestamp(data: dict) -> Optional[datetime]:
