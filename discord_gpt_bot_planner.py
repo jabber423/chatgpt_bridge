@@ -108,6 +108,9 @@ MODE_ADMIN_ROLE_NAME = os.getenv(
 TROLL_TARGET_USER_ID = None
 TROLL_TARGET_GUILD_ID = None
 TROLL_TARGET_NAME = None
+TROLL_TARGET_CHANGE_COOLDOWN_SECONDS = 10 * 60
+TROLL_LOCKED_TARGET_USER_ID = None
+TROLL_TARGET_SET_AT = None
 
 
 def is_mode_admin(message) -> bool:
@@ -150,6 +153,32 @@ async def resolve_troll_target(guild, target_name: str):
         return next(iter(matches.values()))
     return None
 
+
+def lock_troll_target(target_user_id: int, now=None) -> float:
+    global TROLL_LOCKED_TARGET_USER_ID, TROLL_TARGET_SET_AT
+
+    current_time = time.monotonic() if now is None else now
+    if TROLL_LOCKED_TARGET_USER_ID is not None:
+        elapsed = current_time - TROLL_TARGET_SET_AT
+        remaining = TROLL_TARGET_CHANGE_COOLDOWN_SECONDS - elapsed
+        target_is_active = TROLL_TARGET_USER_ID == TROLL_LOCKED_TARGET_USER_ID
+        if remaining > 0:
+            if (
+                target_user_id != TROLL_LOCKED_TARGET_USER_ID
+                or not target_is_active
+            ):
+                return remaining
+        elif not target_is_active or target_user_id != TROLL_LOCKED_TARGET_USER_ID:
+            TROLL_LOCKED_TARGET_USER_ID = target_user_id
+            TROLL_TARGET_SET_AT = current_time
+            return 0
+
+    if target_user_id != TROLL_LOCKED_TARGET_USER_ID:
+        TROLL_LOCKED_TARGET_USER_ID = target_user_id
+        TROLL_TARGET_SET_AT = current_time
+
+    return 0
+
 # Safety bounds. The planner can ask for less, but never more.
 MAX_HISTORY_PER_CHANNEL = int(
     os.getenv("MUSK_GPT_MAX_HISTORY_PER_CHANNEL", "150")
@@ -181,6 +210,7 @@ CHANNELS_TO_IGNORE = {
     "▫softres-tokens",
     "🌀class-assignments",
     "🌀vanguards",
+    "🌌vanguards",
     "warlocks",
     "warriors",
     "priests",
@@ -208,6 +238,9 @@ MAX_IMAGES = int(
 
 LOG_FILE = Path(
     os.getenv("MUSK_GPT_LOG_FILE", "muskazze_gpt_log.jsonl")
+)
+EMBED_LOG_FILE = Path(
+    os.getenv("MUSK_GPT_EMBED_LOG_FILE", "muskazze_gpt_embeds.jsonl")
 )
 ANSWER_PROMPT_FILE = Path(
     os.getenv(
@@ -320,6 +353,14 @@ def write_log(record: dict):
         console_log(f"WARNING: Could not write log: {e}")
 
 
+def write_embed_log(record: dict):
+    try:
+        with EMBED_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        console_log(f"WARNING: Could not write embed capture: {e}")
+
+
 def log_interaction(message, question: str, answer: str, plan: dict):
     write_log({
         "type": "interaction",
@@ -428,6 +469,7 @@ async def collect_channel_history(
 ):
     messages = []
     images = []
+    raid_events = []
 
     try:
         async for msg in channel.history(limit=limit, before=before):
@@ -442,9 +484,16 @@ async def collect_channel_history(
                 parts.append(decoded_content)
 
             # Parse Discord embeds, including Raid-Helper.
-            for embed in msg.embeds:
+            for embed_index, embed in enumerate(msg.embeds):
                 if collect_embeds:
                     embed_parts = []
+                    embed_data = embed.to_dict()
+                    raid_usernames = get_raid_usernames({
+                        "embed": embed_data,
+                    })
+                    event_timestamp = get_raid_event_timestamp({
+                        "embed": embed_data,
+                    })
 
                     if embed.author and embed.author.name:
                         value = await decode_discord_ids(
@@ -467,7 +516,19 @@ async def collect_channel_history(
                         )
                         embed_parts.append(f"Embed description: {value}")
 
-                    for field in embed.fields:
+                    raw_fields = embed_data.get("fields", [])
+                    for field_index, field in enumerate(embed.fields):
+                        field_data = (
+                            raw_fields[field_index]
+                            if field_index < len(raw_fields)
+                            else {}
+                        )
+                        field_usernames = get_raid_usernames({
+                            "embed": {"fields": [field_data]},
+                        })
+                        if raid_usernames and field_usernames:
+                            continue
+
                         field_name = await decode_discord_ids(
                             field.name or "",
                             guild
@@ -482,12 +543,51 @@ async def collect_channel_history(
                             f"{field_name}: {field_value}"
                         )
 
+                    if raid_usernames:
+                        embed_parts.append(
+                            "Raid-Helper response names "
+                            "(all statuses count as a response):\n"
+                            + "\n".join(
+                                f"- {name}"
+                                for name in raid_usernames
+                            )
+                        )
+
                     if embed.footer and embed.footer.text:
                         value = await decode_discord_ids(
                             embed.footer.text,
                             guild
                         )
                         embed_parts.append(f"Footer: {value}")
+
+                    write_embed_log({
+                        "type": "discord_embed",
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "guild": guild.name if guild else "DM",
+                        "guild_id": guild.id if guild else None,
+                        "channel": getattr(channel, "name", "DM"),
+                        "channel_id": getattr(channel, "id", None),
+                        "message_id": msg.id,
+                        "message_timestamp": msg.created_at.isoformat(),
+                        "message_author": msg.author.display_name,
+                        "embed_index": embed_index,
+                        "embed": embed.to_dict(),
+                        "raid_usernames": raid_usernames,
+                        "event_timestamp": (
+                            event_timestamp.isoformat()
+                            if event_timestamp
+                            else None
+                        ),
+                        "flattened_text": "\n".join(embed_parts),
+                    })
+
+                    if raid_usernames:
+                        raid_events.append({
+                            "channel": getattr(channel, "name", "DM"),
+                            "message_timestamp": msg.created_at,
+                            "event_timestamp": event_timestamp,
+                            "usernames": raid_usernames,
+                        })
 
                     if embed_parts:
                         parts.append(
@@ -557,7 +657,7 @@ async def collect_channel_history(
             f"({e})"
         )
 
-    return messages, images
+    return messages, images, raid_events
 
 
 # ============================================================
@@ -740,12 +840,13 @@ async def create_retrieval_plan(message, question: str) -> dict:
 async def execute_retrieval_plan(message, plan: dict):
     if not plan["needs_discord"]:
         console_log("PHASE 2: No Discord history required.")
-        return "", []
+        return "", [], []
 
     console_log("PHASE 2: Executing Discord retrieval plan...")
 
     all_messages = []
     all_images = []
+    all_raid_events = []
 
     if message.guild is None:
         channel_lookup = {
@@ -784,7 +885,7 @@ async def execute_retrieval_plan(message, plan: dict):
             f"images={plan['include_images']}"
         )
 
-        messages, images = await collect_channel_history(
+        messages, images, raid_events = await collect_channel_history(
             channel,
             message.guild,
             item["history"],
@@ -801,6 +902,7 @@ async def execute_retrieval_plan(message, plan: dict):
 
         all_messages.extend(messages)
         all_images.extend(images)
+        all_raid_events.extend(raid_events)
 
     all_messages.sort(
         key=lambda item: item["timestamp"]
@@ -849,7 +951,7 @@ async def execute_retrieval_plan(message, plan: dict):
             f"#{image['channel']} - {image['filename']}"
         )
 
-    return "\n".join(history_lines), selected_images
+    return "\n".join(history_lines), selected_images, all_raid_events
 
 
 # ============================================================
@@ -1076,6 +1178,152 @@ async def send_openai_error(message, error):
 # Discord events
 # ============================================================
 
+def get_raid_usernames(data: dict) -> list[str]:
+    usernames = []
+    seen = set()
+
+    for field in data.get("embed", {}).get("fields", []):
+        value = field.get("value", "")
+
+        # Matches:
+        # `1` **Muskazze**
+        # `19` **Gestaz/Tabaska**
+        # `18` **Scurry(Beeline)**
+        matches = re.findall(
+            r"\\?`\d+\\?`\s+\\?\*\\?\*(.+?)\\?\*\\?\*",
+            value
+        )
+
+        for match in matches:
+            username = match.strip()
+            key = username.casefold()
+            if key not in seen:
+                usernames.append(username)
+                seen.add(key)
+
+    return usernames
+
+
+def get_raid_event_timestamp(data: dict) -> Optional[datetime]:
+    embed = data.get("embed", data)
+    text_parts = [embed.get("description", "")]
+    text_parts.extend(
+        field.get("value", "")
+        for field in embed.get("fields", [])
+    )
+    match = re.search(r"<t:(\d{9,12})(?::[tTdDfFR])?>", "\n".join(text_parts))
+    if not match:
+        return None
+
+    try:
+        return datetime.fromtimestamp(int(match.group(1)), timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def get_raid_roster_names() -> list[str]:
+    try:
+        instructions = load_answer_instructions()
+    except OSError:
+        return []
+
+    try:
+        roster_section = instructions.split("ROSTER:", 1)[1]
+        roster_section = roster_section.split(
+            "CONFIDENCE-CHECK OUTPUT:",
+            1,
+        )[0]
+    except IndexError:
+        return []
+
+    return [
+        line.strip()
+        for line in roster_section.splitlines()
+        if line.strip()
+    ]
+
+
+def normalize_raid_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+
+def answer_no_response_roster_query(
+    question: str,
+    current_channel: str,
+    raid_events: list[dict],
+) -> Optional[str]:
+    normalized_question = " ".join(question.casefold().split())
+    asks_for_missing = any(
+        phrase in normalized_question
+        for phrase in (
+            "hasn't signed up",
+            "has not signed up",
+            "signed up at all",
+            "no response",
+            "responded at all",
+        )
+    )
+    if "roster" not in normalized_question or not asks_for_missing:
+        return None
+
+    day_match = re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        normalized_question,
+    )
+    requested_channel = (
+        f"{day_match.group(1)}-raid"
+        if day_match
+        else current_channel.casefold()
+    )
+    event_candidates = [
+        event
+        for event in raid_events
+        if event["channel"].casefold() == requested_channel
+    ]
+    if not event_candidates:
+        return None
+
+    now = datetime.now(timezone.utc)
+    upcoming_events = [
+        event
+        for event in event_candidates
+        if event.get("event_timestamp")
+        and event["event_timestamp"] >= now
+    ]
+    if upcoming_events:
+        selected_event = min(
+            upcoming_events,
+            key=lambda event: event["event_timestamp"],
+        )
+    else:
+        selected_event = max(
+            event_candidates,
+            key=lambda event: event["message_timestamp"],
+        )
+
+    roster = get_raid_roster_names()
+    if not roster:
+        return None
+
+    responded_names = {
+        normalize_raid_name(name)
+        for name in selected_event["usernames"]
+    }
+    missing_names = []
+
+    for roster_entry in roster:
+        aliases = re.split(r"\s+aka\s+", roster_entry, flags=re.IGNORECASE)
+        if not any(
+            normalize_raid_name(alias) in responded_names
+            for alias in aliases
+        ):
+            missing_names.append(roster_entry)
+
+    if not missing_names:
+        return "No roster members are missing a response."
+
+    return "No response: " + ", ".join(missing_names) + "."
+
 @discord_client.event
 async def on_ready():
     print(f"Logged in as {discord_client.user}")
@@ -1089,6 +1337,7 @@ async def on_ready():
     print(f"Answer prompt file: {ANSWER_PROMPT_FILE.resolve()}")
     print(f"Max images/query: {MAX_IMAGES}")
     print(f"Log file: {LOG_FILE.resolve()}")
+    print(f"Embed capture file: {EMBED_LOG_FILE.resolve()}")
     print("Ready.")
 
 
@@ -1153,6 +1402,18 @@ async def on_message(message):
                 await message.reply(
                     "I couldn't uniquely find that member. Try their exact "
                     "server name or mention them.",
+                    mention_author=False,
+                )
+                return
+
+            cooldown_remaining = lock_troll_target(target.id)
+            if cooldown_remaining > 0:
+                minutes = int(cooldown_remaining // 60)
+                seconds = int(cooldown_remaining % 60)
+                await message.reply(
+                    "Troll target changes and re-enabling troll mode are "
+                    "locked for 10 minutes after selection. Try again in "
+                    f"{minutes}m {seconds}s.",
                     mention_author=False,
                 )
                 return
@@ -1325,7 +1586,7 @@ async def on_message(message):
             message,
             question,
         )
-        discord_history, selected_images = (
+        discord_history, selected_images, raid_events = (
             await execute_retrieval_plan(
                 message,
                 plan,
@@ -1351,7 +1612,19 @@ async def on_message(message):
                 image_urls.append(image["url"])
                 seen_urls.add(image["url"])
 
-        if trigger_type == "qa":
+        answer = answer_no_response_roster_query(
+            question,
+            channel_name,
+            raid_events,
+        )
+        deterministic_signup_answer = answer is not None
+
+        if deterministic_signup_answer:
+            console_log(
+                "PHASE 2: Built no-response answer from parsed "
+                "Raid-Helper names and roster."
+            )
+        elif trigger_type == "qa":
             console_log(
                 "PHASE 2: Evaluating whether the planner-selected context "
                 "supports a confident answer..."
@@ -1394,10 +1667,14 @@ async def on_message(message):
 
         elapsed = time.perf_counter() - start_time
 
-        console_log(
-            f"PHASE 4: OpenAI response received "
-            f"in {elapsed:.2f}s"
-        )
+        if deterministic_signup_answer:
+            console_log(
+                f"PHASE 4: Signup comparison completed in {elapsed:.2f}s"
+            )
+        else:
+            console_log(
+                f"PHASE 4: OpenAI response received in {elapsed:.2f}s"
+            )
 
         log_interaction(
             message,

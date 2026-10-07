@@ -39,6 +39,7 @@ Do not commit tokens or API keys. The bot reads environment variables from its p
 | `MUSK_GPT_MAX_CHANNELS_PER_QUERY` | No | `3` | Maximum number of channels the planner can select. |
 | `MUSK_GPT_MAX_IMAGES` | No | `4` | Maximum number of retrieved images included in an answer request. |
 | `MUSK_GPT_LOG_FILE` | No | `muskazze_gpt_log.jsonl` | Path to the JSON Lines interaction/error log. Relative paths are resolved from the process working directory. |
+| `MUSK_GPT_EMBED_LOG_FILE` | No | `muskazze_gpt_embeds.jsonl` | Path to JSON Lines captures of retrieved Discord embeds, including raw embed fields and decoded flattened text. |
 | `MUSK_GPT_ANSWER_PROMPT_FILE` | No | `answer_mode_prompt.txt` beside the script | Path to the shared answer instructions. The file is read for each answer request, so prompt edits take effect without restarting. |
 
 ## Modes
@@ -73,6 +74,8 @@ enable qa,mentioned,troll mode muskazze
 
 When `troll` is included with a target, the bot must find one unique member by exact case-insensitive display name, username, or global name. A Discord user mention can be used as an unambiguous target. The bot replies to that member's own messages, not every message that mentions their name.
 
+After a target is selected, changing to a different target is blocked for 10 minutes. Repeating the same target is allowed while troll mode remains active, but disabling troll mode and re-enabling it during the cooldown is blocked, even for that same target. Changing other modes does not bypass the target lock. The lock is held in memory and resets when the bot restarts.
+
 If `troll` is enabled without a target, the bot clears any previous troll target, enables `qa` and `mentioned`, and reports that no name was provided. A target name without `troll` is rejected. To disable troll mode, enable the modes you want without `troll`, for example:
 
 ```text
@@ -85,6 +88,8 @@ Runtime changes are held in memory and reset to `MUSK_GPT_MODE` when the bot res
 
 The planner receives the current question and the channels the bot can view, excluding the hardcoded `CHANNELS_TO_IGNORE` list in the Python file. It selects up to `MUSK_GPT_MAX_CHANNELS_PER_QUERY` channels. The Monday, Tuesday, Friday, and Sunday raid channels always have embed collection enabled when selected. The answer prompt is in `answer_mode_prompt.txt` by default and is loaded at request time.
 
+For questions asking who has not responded to a raid signup, the bot parses the Raid-Helper names and deterministically compares them with the roster in the answer prompt. Confirmed, bench, tentative, late, and absence entries all count as responses; the reply contains only roster members absent from every response status.
+
 ## Logs
 
-The console reports incoming messages, the selected route, the planner result, retrieved channels, and whether a reply was sent. Interactions and errors are appended as JSON Lines to `MUSK_GPT_LOG_FILE`.
+The console reports incoming messages, the selected route, the planner result, retrieved channels, and whether a reply was sent. Interactions and errors are appended as JSON Lines to `MUSK_GPT_LOG_FILE`. Each retrieved embed is captured as a JSON Lines record in `MUSK_GPT_EMBED_LOG_FILE` for inspection.
