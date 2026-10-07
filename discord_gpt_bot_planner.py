@@ -32,6 +32,7 @@ def parse_bot_modes(raw_value: str) -> set[str]:
         "planner": "mentioned",
         "qa": "qa",
         "answer": "qa",
+        "troll": "troll",
     }
 
     if value == "both":
@@ -55,6 +56,8 @@ def parse_bot_modes(raw_value: str) -> set[str]:
                 modes.add("mentioned")
             if mask & 2:
                 modes.add("qa")
+            if mask & 4:
+                modes.add("troll")
             if modes:
                 return modes
 
@@ -69,6 +72,8 @@ def parse_bot_modes(raw_value: str) -> set[str]:
             modes.add("mentioned")
         if mask & 2:
             modes.add("qa")
+        if mask & 4:
+            modes.add("troll")
         if modes:
             return modes
 
@@ -86,13 +91,64 @@ def parse_bot_modes(raw_value: str) -> set[str]:
         return modes
 
     raise ValueError(
-        "MUSK_GPT_MODE must be 'mentioned', 'qa', 'both', "
-        "or a bitmask (1|2)"
+        "MUSK_GPT_MODE must be 'mentioned', 'qa', 'troll', 'both', "
+        "or a bitmask (1|2|4)"
     )
 
 
 BOT_MODES = parse_bot_modes(os.getenv("MUSK_GPT_MODE", "mentioned"))
 BOT_MODE = "both" if BOT_MODES == {"mentioned", "qa"} else next(iter(BOT_MODES))
+MODE_ADMIN_USER_ID = int(
+    os.getenv("MUSK_GPT_MODE_ADMIN_USER_ID", "604330313602170960")
+)
+MODE_ADMIN_ROLE_NAME = os.getenv(
+    "MUSK_GPT_MODE_ADMIN_ROLE",
+    "Arbiter",
+).strip().casefold()
+TROLL_TARGET_USER_ID = None
+TROLL_TARGET_GUILD_ID = None
+TROLL_TARGET_NAME = None
+
+
+def is_mode_admin(message) -> bool:
+    if message.author.id == MODE_ADMIN_USER_ID:
+        return True
+
+    return any(
+        str(getattr(role, "name", "")).casefold() == MODE_ADMIN_ROLE_NAME
+        for role in getattr(message.author, "roles", ())
+    )
+
+
+async def resolve_troll_target(guild, target_name: str):
+    if guild is None:
+        return None
+
+    mention_match = re.fullmatch(r"<@!?(\d+)>", target_name.strip())
+    if mention_match:
+        user_id = int(mention_match.group(1))
+        member = guild.get_member(user_id)
+        if member:
+            return member
+        try:
+            return await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+
+    target_key = target_name.strip().casefold()
+    matches = {}
+    for member in guild.members:
+        names = {
+            str(getattr(member, "display_name", "")).casefold(),
+            str(getattr(member, "name", "")).casefold(),
+            str(getattr(member, "global_name", "") or "").casefold(),
+        }
+        if target_key in names:
+            matches[member.id] = member
+
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    return None
 
 # Safety bounds. The planner can ask for less, but never more.
 MAX_HISTORY_PER_CHANNEL = int(
@@ -855,6 +911,47 @@ Answer the user's original message using the retrieved data when relevant.
     return response.output_text
 
 
+def answer_troll_message_sync(
+    target_name: str,
+    message_text: str,
+    current_channel: str,
+    discord_history: str,
+    image_urls: list[str],
+) -> str:
+    prompt_text = f"""
+Write one short, playful, troll-ish reply to {target_name}'s Discord message.
+Keep it light and non-hostile. Joke about the message or game context, not
+protected traits, personal vulnerabilities, or real-world harm. Do not use
+slurs, threats, or severe insults. Return only the reply text.
+
+Current channel: #{current_channel}
+Message:
+{message_text}
+
+Recent channel context:
+{discord_history}
+"""
+    content = [{
+        "type": "input_text",
+        "text": prompt_text,
+    }]
+    for url in image_urls:
+        content.append({
+            "type": "input_image",
+            "image_url": url,
+        })
+
+    response = client_ai.responses.create(
+        model=OPENAI_MODEL,
+        instructions=load_answer_instructions(),
+        input=[{
+            "role": "user",
+            "content": content,
+        }],
+    )
+    return response.output_text
+
+
 def answer_indirect_question_sync(
     question: str,
     current_channel: str,
@@ -873,7 +970,7 @@ Recent channel history:
 --- END HISTORY ---
 
 This is a confidence check. Return only valid JSON with exactly these fields:
-{"confident": true, "answer": "Your concise answer"}
+{{"confident": true, "answer": "Your concise answer"}}
 
 Decide whether you can provide a confident, useful answer under the answer
 instructions. If history does not establish a raid outcome, the configured
@@ -997,6 +1094,9 @@ async def on_ready():
 
 @discord_client.event
 async def on_message(message):
+    global BOT_MODES, BOT_MODE
+    global TROLL_TARGET_USER_ID, TROLL_TARGET_GUILD_ID, TROLL_TARGET_NAME
+
     if message.author.bot:
         return
 
@@ -1006,6 +1106,106 @@ async def on_message(message):
         f"INCOMING from {message.author.display_name} "
         f"in #{channel_name}: {message.content!r}"
     )
+
+    command_text = message.content.strip()
+    if discord_client.user:
+        command_text = re.sub(
+            rf"<@!?{discord_client.user.id}>",
+            "",
+            command_text,
+        ).strip()
+    command_text = re.sub(r"<@&\d+>", "", command_text).strip()
+
+    mode_command = re.fullmatch(
+        r"enable\s+(.+?)\s+mode(?:\s+(.+))?",
+        command_text,
+        re.IGNORECASE,
+    )
+    if mode_command:
+        if not is_mode_admin(message):
+            console_log(
+                f"IGNORED: mode change requested by unauthorized user "
+                f"{message.author.id}."
+            )
+            return
+
+        try:
+            requested_modes = parse_bot_modes(mode_command.group(1))
+        except ValueError:
+            await message.reply(
+                "Use `enable qa,mentioned mode`, or include `troll` "
+                "with a target name.",
+                mention_author=False,
+            )
+            return
+
+        target_name = (mode_command.group(2) or "").strip().rstrip(".! ")
+        if "troll" in requested_modes and target_name:
+            if message.guild is None:
+                await message.reply(
+                    "Troll mode must be configured in a server channel.",
+                    mention_author=False,
+                )
+                return
+
+            target = await resolve_troll_target(message.guild, target_name)
+            if target is None:
+                await message.reply(
+                    "I couldn't uniquely find that member. Try their exact "
+                    "server name or mention them.",
+                    mention_author=False,
+                )
+                return
+
+            TROLL_TARGET_USER_ID = target.id
+            TROLL_TARGET_GUILD_ID = message.guild.id
+            TROLL_TARGET_NAME = target.display_name
+            confirmation = (
+                f"Enabled {', '.join(sorted(requested_modes))} modes; "
+                f"troll target is {target.display_name}."
+            )
+        elif "troll" in requested_modes:
+            requested_modes = {"qa", "mentioned"}
+            TROLL_TARGET_USER_ID = None
+            TROLL_TARGET_GUILD_ID = None
+            TROLL_TARGET_NAME = None
+            confirmation = (
+                "No troll target name was provided; enabled QA and "
+                "mentioned modes instead."
+            )
+        else:
+            if target_name:
+                await message.reply(
+                    "A target name is only accepted when `troll` is one "
+                    "of the enabled modes.",
+                    mention_author=False,
+                )
+                return
+            TROLL_TARGET_USER_ID = None
+            TROLL_TARGET_GUILD_ID = None
+            TROLL_TARGET_NAME = None
+            confirmation = (
+                f"Runtime modes enabled: {', '.join(sorted(requested_modes))}."
+            )
+
+        BOT_MODES = requested_modes
+        BOT_MODE = (
+            "all"
+            if BOT_MODES == {"mentioned", "qa", "troll"}
+            else "both"
+            if BOT_MODES == {"mentioned", "qa"}
+            else next(iter(BOT_MODES))
+        )
+        enabled_modes = ", ".join(sorted(BOT_MODES))
+        console_log(
+            f"RUNTIME MODE UPDATED by {message.author.id}: {enabled_modes}; "
+            f"troll_target={TROLL_TARGET_NAME or 'none'}"
+        )
+        await message.reply(
+            confirmation,
+            mention_author=False,
+        )
+        return
 
     if re.search(r"\bryan\b", message.content, re.IGNORECASE):
         console_log("KEYWORD MATCH: Ryan; sending negative reply.")
@@ -1069,7 +1269,14 @@ async def on_message(message):
             ""
         ).strip()
 
-    if not question and not message.attachments:
+    troll_trigger = (
+        "troll" in BOT_MODES
+        and message.guild is not None
+        and message.guild.id == TROLL_TARGET_GUILD_ID
+        and message.author.id == TROLL_TARGET_USER_ID
+    )
+
+    if not question and not message.attachments and not troll_trigger:
         try:
             await message.reply("What's up?")
         except discord.Forbidden:
@@ -1081,14 +1288,18 @@ async def on_message(message):
     mention_trigger = "mentioned" in BOT_MODES and (mentioned or is_dm)
     qa_trigger = "qa" in BOT_MODES and looks_like_question(question)
 
-    if not mention_trigger and not qa_trigger:
+    if not mention_trigger and not qa_trigger and not troll_trigger:
         console_log(
             "IGNORED: message matched neither enabled trigger "
-            "(direct mention nor question)."
+            "(direct mention, question, nor troll target)."
         )
         return
 
-    trigger_type = "mentioned" if mention_trigger else "qa"
+    trigger_type = (
+        "troll"
+        if troll_trigger
+        else "mentioned" if mention_trigger else "qa"
+    )
 
     print()
     console_log("=" * 72)
@@ -1158,6 +1369,19 @@ async def on_message(message):
                     "no reply sent."
                 )
                 return
+        elif trigger_type == "troll":
+            console_log(
+                f"PHASE 2: Generating playful reply for troll target "
+                f"{TROLL_TARGET_NAME}."
+            )
+            answer = await asyncio.to_thread(
+                answer_troll_message_sync,
+                TROLL_TARGET_NAME or message.author.display_name,
+                question,
+                channel_name,
+                discord_history,
+                image_urls,
+            )
         else:
             console_log("PHASE 2: Answering direct mention regardless of confidence...")
             answer = await asyncio.to_thread(
